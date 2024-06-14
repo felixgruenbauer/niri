@@ -80,6 +80,9 @@ tracy-client.workspace = true
 url = { version = "2.5.2", optional = true }
 xcursor = "0.3.5"
 zbus = { version = "~3.15.2", optional = true }
+wayland-scanner = "0.31.2"
+wayland-server = "0.31.2"
+wayland-backend = "0.3.4"
 
 [dependencies.smithay]
 workspace = true

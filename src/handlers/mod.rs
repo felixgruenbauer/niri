@@ -1,6 +1,7 @@
 mod compositor;
 mod layer_shell;
 mod xdg_shell;
+mod workspace;
 
 use std::fs::File;
 use std::io::Write;

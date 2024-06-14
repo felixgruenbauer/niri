@@ -116,6 +116,7 @@ use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyManagerState};
+use crate::protocols::workspace::{self, ForeignWorkspaceManagerState};
 use crate::pw_utils::{Cast, PipeWire};
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::pw_utils::{CastSizeChange, CastTarget, PwToNiri};
@@ -203,6 +204,7 @@ pub struct Niri {
     pub layer_shell_state: WlrLayerShellState,
     pub session_lock_state: SessionLockManagerState,
     pub foreign_toplevel_state: ForeignToplevelManagerState,
+    pub foreign_workspace_state: ForeignWorkspaceManagerState,
     pub screencopy_state: ScreencopyManagerState,
     pub output_management_state: OutputManagementManagerState,
     pub viewporter_state: ViewporterState,
@@ -519,6 +521,7 @@ impl State {
         self.update_keyboard_focus();
         self.refresh_pointer_focus();
         foreign_toplevel::refresh(self);
+        workspace::refresh::<State>(self);
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
 
@@ -1559,6 +1562,10 @@ impl Niri {
                 !client.get_data::<ClientState>().unwrap().restricted
             });
         output_management_state.on_config_changed(config_.outputs.clone());
+        let foreign_workspace_state =
+            ForeignWorkspaceManagerState::new::<State, _>(&display_handle, |client| {
+                !client.get_data::<ClientState>().unwrap().restricted
+            });
         let screencopy_state = ScreencopyManagerState::new::<State, _>(&display_handle, |client| {
             !client.get_data::<ClientState>().unwrap().restricted
         });
@@ -1704,6 +1711,7 @@ impl Niri {
             session_lock_state,
             foreign_toplevel_state,
             output_management_state,
+            foreign_workspace_state,
             screencopy_state,
             viewporter_state,
             xdg_foreign_state,
