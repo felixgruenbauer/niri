@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use arrayvec::ArrayVec;
+use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_wlr;
@@ -21,7 +22,10 @@ use wayland_protocols_wlr::foreign_toplevel::v1::server::{
 use zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1;
 use zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 
+use crate::layout::workspace::WorkspaceId;
+use crate::layout::LayoutElement;
 use crate::niri::State;
+use crate::window;
 
 const VERSION: u32 = 3;
 
@@ -29,6 +33,7 @@ pub struct ForeignToplevelManagerState {
     display: DisplayHandle,
     instances: Vec<ZwlrForeignToplevelManagerV1>,
     toplevels: HashMap<WlSurface, ToplevelData>,
+    visible_toplevel: Vec<WlSurface>
 }
 
 pub trait ForeignToplevelHandler {
@@ -68,6 +73,7 @@ impl ForeignToplevelManagerState {
             display: display.clone(),
             instances: Vec::new(),
             toplevels: HashMap::new(),
+            visible_toplevel: Vec::new(),
         }
     }
 }
@@ -129,6 +135,45 @@ pub fn refresh(state: &mut State) {
             refresh_toplevel(protocol_state, wl_surface, &role, output.as_ref(), true);
         });
     }
+    
+
+    
+
+    // code to only send windows on the active workspace to the taskbar 
+    // only way at the moment is to abuse the foreign toplevel output_enter and output_leave events
+    // 
+    // get toplevels on active workspace in correct order from niri
+    let niri_order = if let Some(active_workspace) = state.niri.layout.active_workspace() {
+        active_workspace.windows().map(|w| w.toplevel().wl_surface()).cloned().collect::<Vec<_>>()
+    } else { vec![] };
+    
+    if niri_order != protocol_state.visible_toplevel {
+        // if a window was removed(moved to an inactive workspace) we only have to output_leave the window
+        // output_leave all toplevels not on current niri active workspace, covers case that a windows was removed and first part of active workspace switch
+        // when output_leave ing the order is not important
+        for wl_surface in protocol_state.visible_toplevel.iter().filter(|wl_output| !niri_order.contains(wl_output)) {
+            if let Some(toplevel) = protocol_state.toplevels.get(wl_surface) {
+                toplevel.instances.iter().for_each(|(i, o)| {
+                    o.iter().for_each(|wl_output| i.output_leave(wl_output));
+                    i.done();
+                })
+            }
+        }
+        // if the active workspace changed we have to output_leave the whole previous workspace and output_enter all windows of the active workspace
+        // the toplevel should be ordered correctly when output_enter ing
+        // in order to reorder we need to output_leave before output_enter
+        for wl_surface in niri_order.iter() {
+            protocol_state.toplevels.get(wl_surface).unwrap_or_else(|| todo!()).instances.iter().for_each(|(i, o)| {
+                    o.iter().for_each(|wl_output| i.output_leave(wl_output));
+                    o.iter().for_each(|wl_output| i.output_enter(wl_output));
+                    i.done();
+                })
+    
+        }       
+        protocol_state.visible_toplevel = niri_order;
+    }
+
+   
 }
 
 pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput) {
