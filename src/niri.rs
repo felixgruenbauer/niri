@@ -521,7 +521,7 @@ impl State {
         self.update_keyboard_focus();
         self.refresh_pointer_focus();
         foreign_toplevel::refresh(self);
-        workspace::refresh::<State>(self);
+        workspace::refresh(self);
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
 

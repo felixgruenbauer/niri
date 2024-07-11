@@ -17,7 +17,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::niri::{self, State};
 use crate::protocols::wayland_protocols::ext::workspace::v0::server::{
     zext_workspace_group_handle_v1::{self, ZextWorkspaceGroupHandleV1},
-    zext_workspace_handle_v1::{self, ZextWorkspaceHandleV1, State as WorkspaceStateV0},
+    zext_workspace_handle_v1::{self, State as WorkspaceStateV0, ZextWorkspaceHandleV1},
     zext_workspace_manager_v1::{self, ZextWorkspaceManagerV1},
 };
 use crate::protocols::wayland_protocols::ext::workspace::v1::server::{
@@ -35,7 +35,7 @@ pub struct ForeignWorkspaceManagerState {
     client_requests: HashMap<ClientId, Vec<Request>>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct WorkspaceGroup {
     instances: Vec<GroupHandle>,
     pub workspaces: Vec<Workspace>,
@@ -57,8 +57,8 @@ impl ManagerHandle {
     }
     fn version(&self) -> u32 {
         match self {
-            ManagerHandle::V1(handle) => 1,
-            ManagerHandle::V0(handle) => 0,
+            ManagerHandle::V1(_) => 1,
+            ManagerHandle::V0(_) => 0,
         }
     }
     fn interface(&self) -> &'static Interface {
@@ -75,8 +75,12 @@ impl ManagerHandle {
             (ManagerHandle::V0(manager_handle), GroupHandle::V0(group_handle)) => {
                 manager_handle.workspace_group(group_handle)
             }
-            (ManagerHandle::V1(_), GroupHandle::V0(_)) => todo!(),
-            (ManagerHandle::V0(_), GroupHandle::V1(_)) => todo!(),
+            (ManagerHandle::V1(_), GroupHandle::V0(_)) => error!(
+                "trying to send workspace_group event for grouphandle_v0 to managerhandle_v1"
+            ),
+            (ManagerHandle::V0(_), GroupHandle::V1(_)) => error!(
+                "trying to send workspace_group event for grouphandle_v1 to managerhandle_v0"
+            ),
         }
     }
     fn done(&self) {
@@ -102,12 +106,24 @@ impl GroupHandle {
     }
     pub fn workspace(&self, workspace: &WorkspaceHandle) {
         match (&self, workspace) {
-            (GroupHandle::V1(group_handle), WorkspaceHandle::V1(workspace_handle)) => {}
+            (GroupHandle::V1(_), WorkspaceHandle::V1(_)) => {
+                error!("version 1 does not have a workspace event for a grouphandle")
+            }
             (GroupHandle::V0(group_handle), WorkspaceHandle::V0(workspace_handle)) => {
                 group_handle.workspace(workspace_handle);
             }
-            (GroupHandle::V1(_), WorkspaceHandle::V0(_)) => todo!(),
-            (GroupHandle::V0(_), WorkspaceHandle::V1(_)) => todo!(),
+            (GroupHandle::V1(_), WorkspaceHandle::V0(_)) => {
+                error!("grouphandle and workspacehandle version/interface mismatch")
+            }
+            (GroupHandle::V0(_), WorkspaceHandle::V1(_)) => {
+                error!("grouphandle and workspacehandle version/interface mismatch")
+            }
+        }
+    }
+    pub fn output_leave(&self, output: &WlOutput) {
+        match &self {
+            GroupHandle::V1(handle) => handle.output_leave(output),
+            GroupHandle::V0(handle) => handle.output_leave(output),
         }
     }
     pub fn output_enter(&self, output: &WlOutput) {
@@ -122,9 +138,15 @@ impl GroupHandle {
             GroupHandle::V0(handle) => handle.remove(),
         }
     }
+    pub fn client(&self) -> Option<Client> {
+        match &self {
+            GroupHandle::V1(handle) => handle.client(),
+            GroupHandle::V0(handle) => handle.client(),
+        }
+    }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct Workspace {
     pub instances: Vec<WorkspaceHandle>,
     name: Option<String>,
@@ -151,18 +173,19 @@ impl WorkspaceHandle {
     pub fn state(&self, state: &HashSet<WorkspaceState>) {
         match &self {
             WorkspaceHandle::V1(handle) => {
-                handle.state(ext_workspace_handle_v1::State::from_bits_truncate(state.iter().map(|s| s.value()).sum::<u8>() as u32));
+                handle.state(ext_workspace_handle_v1::State::from_bits_truncate(
+                    state.iter().map(|s| s.value()).sum::<u8>() as u32,
+                ));
             }
             WorkspaceHandle::V0(handle) => {
                 handle.state(state.iter().fold(vec![7u8, 0, 0, 0], |mut acc, s| {
-                    match s{
+                    match s {
                         WorkspaceState::Active => acc[0] = 0,
                         WorkspaceState::Urgent => acc[1] = 0,
                         WorkspaceState::Hidden => acc[2] = 0,
                     };
                     acc
-                }
-            ))
+                }))
             }
         }
     }
@@ -243,67 +266,12 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let instance = ManagerHandle::V1(data_init.init(resource, ()));
-        send_full_info(state, dh, instance);
+        state.foreign_workspace_state_mut().add_instance(dh, instance);
     }
 
     fn can_view(client: Client, global_data: &ForeignWorkspaceGlobalData) -> bool {
         (global_data.filter)(&client)
     }
-}
-
-fn send_full_info<D: ForeignWorkspaceDispatch>(
-    state: &mut D,
-    dh: &DisplayHandle,
-    manager_instance: ManagerHandle,
-) {
-    let state = state.foreign_workspace_state_mut();
-    for group in state.groups.iter_mut() {
-        group.add_instance::<State>(dh, &manager_instance);
-        if let Some(client) = manager_instance.client() {
-            if let Some(output) = &group.output {
-                for wl_output in output.client_outputs(&client) {
-                    group.instances[state.instances.len()].output_enter(&wl_output);
-                }
-            }
-        }
-        for workspace in group.workspaces.iter_mut() {
-            workspace.add_instance::<State>(
-                dh,
-                &manager_instance,
-                &group.instances.last().unwrap().clone(),
-            );
-            if let Some(name) = &workspace.name {
-                workspace
-                    .instances
-                    .iter()
-                    .for_each(|i| i.name(name.clone()));
-            }
-            if !workspace.coordinates.is_empty() {
-                workspace
-                    .instances
-                    .last()
-                    .unwrap_or_else(|| todo!())
-                    .coordinates(workspace.coordinates.clone());
-            }
-            workspace
-                .instances
-                .last()
-                .unwrap_or_else(|| todo!())
-                .state(&workspace.states);
-            if manager_instance.version() == 1 {
-                if let GroupHandle::V1(group_inner) = group.instances.last().unwrap() {
-                    if let WorkspaceHandle::V1(workspace_inner) =
-                        workspace.instances.last().unwrap()
-                    {
-                        group_inner.workspace_enter(&workspace_inner);
-                    }
-                }
-            };
-        }
-    }
-
-    manager_instance.done();
-    state.instances.push(manager_instance);
 }
 
 impl<D> GlobalDispatch<ZextWorkspaceManagerV1, ForeignWorkspaceGlobalData, D>
@@ -320,7 +288,7 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let instance = ManagerHandle::V0(data_init.init(resource, ()));
-        send_full_info(state, dh, instance);
+        state.foreign_workspace_state_mut().add_instance(dh, instance);
     }
 
     fn can_view(client: Client, global_data: &ForeignWorkspaceGlobalData) -> bool {
@@ -668,6 +636,21 @@ impl ForeignWorkspaceManagerState {
         }
     }
 
+    fn add_instance(&mut self, dh: &DisplayHandle, manager_instance: ManagerHandle) {
+        for group in self.groups.iter_mut() {
+            group.add_instance(dh, &manager_instance);
+            for workspace in group.workspaces.iter_mut() {
+                workspace.add_instance(
+                    dh,
+                    &manager_instance,
+                    &group.instances.last().unwrap().clone(),
+                );
+            }
+        }
+        manager_instance.done();
+        self.instances.push(manager_instance);
+    }
+
     pub fn group_workspace_from_handle(
         &self,
         workspace_handle: &WorkspaceHandle,
@@ -689,17 +672,12 @@ impl ForeignWorkspaceManagerState {
     }
 }
 impl Workspace {
-    fn add_instance<D>(&mut self, dh: &DisplayHandle, manager: &ManagerHandle, group: &GroupHandle)
-    where
-        D: Dispatch<ZextWorkspaceHandleV1, ()>,
-        D: Dispatch<ExtWorkspaceHandleV1, ()>,
-        D: 'static,
-    {
+    fn add_instance(&mut self, dh: &DisplayHandle, manager: &ManagerHandle, group: &GroupHandle) {
         if let Some(client) = manager.client() {
             if let Some(handle) = match manager {
                 ManagerHandle::V1(manager_handle) => {
                     if let Some(workspace_handle) = client
-                        .create_resource::<ExtWorkspaceHandleV1, (), D>(&dh, 1u32, ())
+                        .create_resource::<ExtWorkspaceHandleV1, (), State>(&dh, 1u32, ())
                         .ok()
                     {
                         manager_handle.workspace(&workspace_handle);
@@ -713,8 +691,8 @@ impl Workspace {
                 }
                 ManagerHandle::V0(_) => {
                     if let Some(workspace_handle) = client
-                        .create_resource::<ZextWorkspaceHandleV1, (), D>(&dh, 1u32, ())
-                        .map_or(None, |h| Some(h))
+                        .create_resource::<ZextWorkspaceHandleV1, (), State>(&dh, 1u32, ())
+                        .ok()
                     {
                         if let GroupHandle::V0(group_handle) = group {
                             group_handle.workspace(&workspace_handle);
@@ -725,6 +703,13 @@ impl Workspace {
                     }
                 }
             } {
+                if let Some(name) = &self.name {
+                    handle.name(name.clone());
+                }
+                if !self.coordinates.is_empty() {
+                    handle.coordinates(self.coordinates.clone());
+                }
+                handle.state(&self.states);
                 self.instances.push(handle);
             }
         }
@@ -732,39 +717,56 @@ impl Workspace {
 }
 
 impl WorkspaceGroup {
-    fn add_instance<D>(&mut self, dh: &DisplayHandle, manager: &ManagerHandle)
-    where
-        D: Dispatch<ZextWorkspaceGroupHandleV1, ()>,
-        D: Dispatch<ExtWorkspaceGroupHandleV1, ()>,
-        D: 'static,
-    {
+    fn add_instance(&mut self, dh: &DisplayHandle, manager: &ManagerHandle) {
         if let Some(client) = manager.client() {
             if let Some(handle) = match manager.version() {
                 1 => client
-                    .create_resource::<ExtWorkspaceGroupHandleV1, (), D>(&dh, 1u32, ())
+                    .create_resource::<ExtWorkspaceGroupHandleV1, (), State>(&dh, 1u32, ())
                     .map_or(None, |h| Some(GroupHandle::V1(h))),
                 0 => client
-                    .create_resource::<ZextWorkspaceGroupHandleV1, (), D>(&dh, 1u32, ())
+                    .create_resource::<ZextWorkspaceGroupHandleV1, (), State>(&dh, 1u32, ())
                     .map_or(None, |h| Some(GroupHandle::V0(h))),
                 _ => None,
             } {
                 manager.workspace_group(&handle);
+                if let (Some(output), Some(client)) = (&self.output, handle.client()) {
+                    for wl_output in output.client_outputs(&client).iter().filter(|wl| wl.client().is_some_and(|c| c.id() == client.id())) {
+                        handle.output_enter(&wl_output)
+                    }
+                }
                 self.instances.push(handle);
             }
         }
     }
+
+    pub fn output_enter(&mut self, output: Output) {
+        for instance in self.instances.iter() {
+            if let Some(client) = instance.client() {
+                for wl_output in output.client_outputs(&client).iter().filter(|wl| wl.client().is_some_and(|c| c.id() == client.id())) {
+                    instance.output_enter(wl_output)
+                }
+            }
+        }
+        self.output = Some(output);
+    }
+    pub fn output_leave(&mut self, output: &Output) {
+        for instance in self.instances.iter() {
+            if let Some(client) = instance.client() {
+                for wl_output in output.client_outputs(&client).iter().filter(|wl| wl.client().is_some_and(|c| c.id() == client.id())) {
+                    instance.output_leave(wl_output)
+                }
+            }
+        }
+        self.output = None;
+    }
 }
 
-pub fn refresh<D>(state: &mut State)
-where
-    D: Dispatch<ZextWorkspaceGroupHandleV1, ()> + Dispatch<ZextWorkspaceHandleV1, ()> + 'static,
+pub fn refresh(state: &mut State)
 {
     let protocol_state = &mut state.niri.foreign_workspace_state;
     let mut changed = false;
-    
+
     let ipc_workspaces = &state.niri.layout.ipc_workspaces();
-    
-    debug!("ipc workspaces info: {:?}", ipc_workspaces);
 
     // remove groups that are assigned to an output, which is no longer valid/existing
     // first for all workspaces in group send instance.remove then destroy workspace struct
@@ -793,7 +795,10 @@ where
             .iter()
             .filter(|ws| ws.output == group.output.as_ref().map(|o| o.name()))
             .count();
-        for workspace in group.workspaces.drain(target_count.min(group.workspaces.len())..) {
+        for workspace in group
+            .workspaces
+            .drain(target_count.min(group.workspaces.len())..)
+        {
             workspace.instances.iter().for_each(|i| i.removed());
             changed = true;
         }
@@ -807,97 +812,64 @@ where
         {
             group
         } else {
-            let output = niri_workspace.output.as_ref().and_then(|n| {
-                state
-                    .niri
-                    .layout
-                    .outputs()
-                    .into_iter()
-                    .find(|o| o.name() == *n)
-            });
-            protocol_state.groups.push(WorkspaceGroup {
-                instances: Vec::new(),
-                output: output.cloned(),
-                workspaces: Vec::new(),
-            });
+            protocol_state.groups.push(WorkspaceGroup::default());
             let group = protocol_state.groups.last_mut().unwrap();
             for manager in protocol_state.instances.iter() {
-                group.add_instance::<State>(&protocol_state.dh, manager);
-            }
-            if let Some(output) = output {
-                for manager in protocol_state.instances.iter() {
-                    if let Some(client) = manager.client() {
-                        for wl_output in output.client_outputs(&client).iter() {
-                            group
-                                .instances
-                                .iter()
-                                .for_each(|i| i.output_enter(wl_output));
-                        }
-                    }
-                }
+                group.add_instance(&protocol_state.dh, manager);
             }
             changed = true;
             group
         };
-        let workspace = if let Some(workspace) =
-            group.workspaces.get_mut((niri_workspace.idx - 1) as usize)
-        {
-            workspace
-        } else {
-            group.workspaces.push(Workspace {
-                instances: Vec::new(),
-                name: None,
-                coordinates: Vec::new(),
-                states: HashSet::new(),
-            });
-            let workspace = group.workspaces.last_mut().unwrap();
-            for (idx, manager) in protocol_state.instances.iter().enumerate() {
-                workspace.add_instance::<State>(&protocol_state.dh, manager, &group.instances[idx])
+
+        // refresh outputs
+        // - get output object for name string from ipc call
+        // - compare outputs and handle changes
+        match (niri_workspace.output.as_ref().and_then(|n| {
+            state
+                .niri
+                .layout
+                .outputs()
+                .into_iter()
+                .find(|o| o.name() == *n)
+        }), &group.output) {
+            (None, None) => {},
+            (None, Some(output)) => {
+                group.output_leave(&output.clone());
+                changed = true;
             }
-            changed = true;
-            workspace
-        };
-        if workspace.name != niri_workspace.name {
-            workspace.name = niri_workspace.name.clone();
-            workspace
-                .instances
-                .iter()
-                .for_each(|i| i.name(workspace.name.clone().unwrap_or("".to_string())));
-            changed = true;
+            (Some(niri_output), None) => {
+                group.output_enter(niri_output.clone());
+                changed = true;
+            }
+            (Some(niri_output), Some(output)) => {
+                if niri_output != output {
+                    group.output_leave(&output.clone());
+                    group.output_enter(niri_output.clone());
+                    changed = true;
+                }
+            }
         }
-        if let Some(coordinate) = workspace.coordinates.get_mut(0) {
-            if coordinate != &(niri_workspace.idx - 1) {
-                *coordinate = niri_workspace.idx - 1;
+
+        let workspace =
+            if let Some(workspace) = group.workspaces.get_mut((niri_workspace.idx - 1) as usize) {
                 workspace
-                    .instances
-                    .iter()
-                    .for_each(|i| i.coordinates(workspace.coordinates.clone()));
+            } else {
+                group.workspaces.push(Workspace::default());
+                let workspace = group.workspaces.last_mut().unwrap();
+                workspace.coordinates = vec![niri_workspace.idx - 1];
+                workspace.states = if niri_workspace.is_active {HashSet::from([WorkspaceState::Active])} else {HashSet::new()};
+                for (idx, manager) in protocol_state.instances.iter().enumerate() {
+                    if let Some(client) = manager.client() {
+                        //if let Some(group_handle) = group.instances.iter().find(|i| i.client().is_some_and(|c| c.id() == client.id())) {
+                            workspace.add_instance(&protocol_state.dh, manager, &group.instances[idx]);
+                        //}
+                    }
+                }
                 changed = true;
-            }
-        } else {
-            workspace.coordinates.push(niri_workspace.idx - 1);
-            workspace
-                .instances
-                .iter()
-                .for_each(|i| i.coordinates(workspace.coordinates.clone()));
+                workspace
+            };
+        if refresh_workspace(niri_workspace, workspace) {
             changed = true;
-        }
-        if niri_workspace.is_active {
-            if !workspace.states.contains(&WorkspaceState::Active) {
-                workspace.states.insert(WorkspaceState::Active);
-                workspace
-                    .instances
-                    .iter()
-                    .for_each(|i| i.state(&workspace.states));
-                changed = true;
-            }
-        } else {
-            if workspace.states.contains(&WorkspaceState::Active) {
-                workspace.states.remove(&WorkspaceState::Active);
-                changed = true;
-                // state change event
-                workspace.instances.iter().for_each(|i| i.state(&workspace.states));
-            }
         }
     }
 
@@ -906,6 +878,51 @@ where
             manager.done()
         }
     }
+}
+
+fn refresh_workspace(niri_workspace: &niri_ipc::Workspace, workspace: &mut Workspace) -> bool {
+    let mut changed = false;
+
+    if workspace.name != niri_workspace.name {
+        workspace.name = niri_workspace.name.clone();
+        workspace
+            .instances
+            .iter()
+            .for_each(|i| i.name(workspace.name.clone().unwrap_or("".to_string())));
+        changed = true;
+    }
+    if let Some(coordinate) = workspace.coordinates.get_mut(0) {
+        if coordinate != &(niri_workspace.idx - 1) {
+            *coordinate = niri_workspace.idx - 1;
+            workspace
+                .instances
+                .iter()
+                .for_each(|i| i.coordinates(workspace.coordinates.clone()));
+            changed = true;
+        }
+    } else {
+        workspace.coordinates.push(niri_workspace.idx - 1);
+        workspace
+            .instances
+            .iter()
+            .for_each(|i| i.coordinates(workspace.coordinates.clone()));
+        changed = true;
+    }
+
+    let mut niri_workspace_state = HashSet::new();
+    if niri_workspace.is_active {
+        niri_workspace_state.insert(WorkspaceState::Active);
+    };
+    
+    if niri_workspace_state != workspace.states {
+        workspace.states = niri_workspace_state;
+        workspace
+            .instances
+            .iter()
+            .for_each(|i| i.state(&workspace.states));
+        changed = true;
+    }
+    changed
 }
 
 macro_rules! delegate_workspace {
